@@ -32,15 +32,13 @@ class Settings:
     telegram_bot_token: str
     telegram_allowed_chat_ids: set[int]
 
-    mws_api_base: str
+    mws_vpc_base: str
     mws_iam_base: str
     mws_api_token: str
     mws_sa_key_file: Path | None
     mws_project_id: str
-    mws_network_id: str
+    mws_nat_gateway: str
     mws_region: str
-    mws_region_code: str
-    mws_zone_code: str
     mws_ip_quota: int
 
     proxy: str
@@ -64,17 +62,15 @@ class Settings:
         return cls(
             telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
             telegram_allowed_chat_ids=_csv_ints(os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "")),
-            mws_api_base=os.environ.get("MWS_API_BASE", "https://gateway.cloud.mts.ru").rstrip("/"),
+            mws_vpc_base=os.environ.get("MWS_VPC_BASE", "https://vpc.mwsapis.ru").rstrip("/"),
             mws_iam_base=os.environ.get("MWS_IAM_BASE", "https://iam.mwsapis.ru").rstrip("/"),
             mws_api_token=os.environ.get("MWS_API_TOKEN", ""),
             mws_sa_key_file=(
                 Path(raw) if (raw := os.environ.get("MWS_SA_KEY_FILE", "").strip()) else None
             ),
             mws_project_id=os.environ.get("MWS_PROJECT_ID", ""),
-            mws_network_id=os.environ.get("MWS_NETWORK_ID", ""),
+            mws_nat_gateway=os.environ.get("MWS_NAT_GATEWAY", ""),
             mws_region=os.environ.get("MWS_REGION", "msk"),
-            mws_region_code=os.environ.get("MWS_REGION_CODE", "msk"),
-            mws_zone_code=os.environ.get("MWS_ZONE_CODE", ""),
             mws_ip_quota=int(os.environ.get("MWS_IP_QUOTA", "5")),
             proxy=os.environ.get("PROXY", ""),
             hunt_strategy=os.environ.get("HUNT_STRATEGY", "release_immediately"),

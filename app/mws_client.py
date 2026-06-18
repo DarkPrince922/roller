@@ -1,14 +1,12 @@
 """MWS (MTS Web Services) cloud API client -- public IP create/get/list/delete,
 plus IAM service-account token issuance.
 
-Confirmed against the public docs at https://docs.cloud.mts.ru/api/ (auth.html,
-errors.html, open-api-computecloud.html) and the official OpenAPI specs/SDK at
+Confirmed against the official OpenAPI specs and reference Go SDK at
 https://github.com/mws-cloud-platform/api and https://github.com/mws-cloud-platform/go-sdk
 at the time this was written:
 
-  * Resource gateway: https://gateway.cloud.mts.ru
-  * IAM gateway: https://iam.mwsapis.ru (separate host from the resource gateway).
-  * Auth for resource calls: `Authorization: Bearer <IAM access token>`. The access
+  * IAM gateway: https://iam.mwsapis.ru -- service-account-key-to-access-token exchange.
+    Auth for resource calls: `Authorization: Bearer <IAM access token>`. The access
     token is short-lived and must be obtained by exchanging a service account's
     "authorized key" (an ES256 keypair, created in the console under IAM / Сервисные
     аккаунты) for a token:
@@ -21,23 +19,47 @@ at the time this was written:
          header to the signed JWS verbatim).
       3. Response is `{"accessToken": "...", "expirationTs": "<RFC3339>"}` (`accessToken`
          is the only required field). That `accessToken` is the value used as the
-         `Bearer` token for the resource gateway, and must be refreshed before expiry.
+         `Bearer` token for all other mws-cloud-platform services, and must be
+         refreshed before expiry.
     This is implemented below (`ServiceAccountKey` + `MwsClient._ensure_token`). A
     static long-lived `MWS_API_TOKEN` is still supported as a manual-override fallback
     for cases where the caller already has a valid access token and doesn't want to
     configure a service-account key -- but it is NOT auto-refreshed and will expire.
-  * Idempotency: `Idempotency-Key: <uuid4>` header on resource-creation requests.
-  * Generic resource model: POST {base}/ocs/v1/services with
-      {"platform": {"productCode": "network", "regionCode": ...},
-       "kind": "ip", "metadata": {...}, "parentBinding": {"targetId": <networkId>},
-       "projectId": ..., "spec": {}, "zoneCode": ...}
-  * Error body: {"code": ..., "domain": ..., "details": {...}}.
 
-NOT independently confirmed -- marked TODO, verify against the live OpenAPI spec
-before relying on them in production:
-  * Exact JSON path of the assigned IP address in the create/get response.
-  * Query params for listing existing services filtered by kind=ip.
-  * Whether DELETE returns the IP to the pool immediately or with a delay.
+  * Resource gateway for public IPs: https://vpc.mwsapis.ru (the VPC service). Public
+    IPv4/IPv6 addresses are modelled as the "external address" resource, per
+    `openapi/vpc/openapi.gen.yaml`:
+      - `GET    /vpc/v1/projects/{project}/externalAddresses`               (list, paginated)
+      - `POST   /vpc/v1/projects/{project}/externalAddresses/{name}`        (create/update --
+         "upsert"; `?createOnly=true` makes it fail with `ALREADY_EXISTS` instead of
+         updating an existing resource)
+      - `GET    /vpc/v1/projects/{project}/externalAddresses/{name}`        (get)
+      - `DELETE /vpc/v1/projects/{project}/externalAddresses/{name}`        (delete, 204)
+    Unlike a typical POST-to-collection-returns-generated-id flow, `{name}` is chosen
+    by the caller (DNS-label-ish: `^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$`) and is the only
+    identifier needed for subsequent get/delete -- there is no separate generated
+    "service id" to track. Request body shape (`ExternalAddressRequest`):
+        {"metadata": {"displayName": ..., "description": ...},
+         "spec": {"natGateway": "<optional ref, defaults to natGateways/internet-gateway>"}}
+    Response body shape (`ExternalAddressResponse`):
+        {"kind": "vpc/v1/externalAddress",
+         "metadata": {"id": "vpc/projects/{project}/externalAddresses/{name}", ...},
+         "spec": {"natGateway": ...},
+         "status": {"ready": {"state": "OK"|"FAILED"|"PROCESSING"}, "ipAddress": "1.2.3.4",
+                    "active": true}}
+    This resource has no region/zone scoping at the API level -- only `project`.
+
+  * Idempotency: `Idempotency-Key: <uuid4>` header, supported on the create (POST) and
+    delete operations.
+  * Error body (`ApiError`): {"code": "<ENUM, e.g. QUOTA_EXCEEDED/UNAUTHENTICATED/...>",
+    "description": ..., "details": {...}}. Note this has no "domain" field -- a `domain:
+    hub` 401 (as originally reported) is NOT from this API; it's a sign requests are
+    hitting an unrelated/legacy gateway.
+
+This file previously called a guessed `POST {base}/ocs/v1/services` resource model on
+`https://gateway.cloud.mts.ru`, which does not appear anywhere in the official
+mws-cloud-platform OpenAPI specs and is almost certainly why every call failed with a
+401 from a `hub` auth domain regardless of the IAM token being valid.
 """
 from __future__ import annotations
 
@@ -61,9 +83,7 @@ from app.config import Settings
 
 logger = logging.getLogger(__name__)
 
-CREATE_PATH = "/ocs/v1/services"
-PRODUCT_CODE = "network"
-RESOURCE_KIND = "ip"
+EXTERNAL_ADDRESS_NAME_PREFIX = "ip-hunter-"
 
 IAM_TOKEN_PATH = "/iam/v2/tokens/:issueServiceAccountToken"
 JWT_ALG = "ES256"
@@ -79,19 +99,20 @@ _AUTHORIZED_KEY_ID_RE = re.compile(
     r"^projects/(?P<project>[^/]+)/serviceAccounts/(?P<service_account>[^/]+)"
     r"/authorizedKeys/(?P<key>[^/]+)$"
 )
+_RESOURCE_NAME_RE = re.compile(r"/externalAddresses/(?P<name>[^/]+)$")
 
 
 class MwsApiError(Exception):
     def __init__(self, kind: str, message: str, status: int | None = None, code: str | None = None):
         super().__init__(message)
-        self.kind = kind  # "auth" | "quota" | "proxy" | "network" | "server" | "unknown"
+        self.kind = kind  # "auth" | "quota" | "rate_limit" | "proxy" | "network" | "server" | "unknown"
         self.status = status
         self.code = code
 
 
 @dataclass
 class ReservedIp:
-    service_id: str
+    service_id: str  # the externalAddress resource name, e.g. "ip-hunter-..."
     ip: str | None
     status: str
     region: str | None
@@ -152,38 +173,39 @@ def _parse_iso8601(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def _generate_address_name() -> str:
+    """A name matching the externalAddress path pattern
+    ^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ -- chosen by the caller, not server-generated."""
+    return f"{EXTERNAL_ADDRESS_NAME_PREFIX}{uuid.uuid4().hex[:16]}"
+
+
 def _extract_ip(payload: dict) -> str | None:
-    """Best-effort extraction of the assigned address from a service payload.
-    Response field names are unconfirmed (see module docstring) -- this tries
-    the shapes seen in other MWS OpenAPI examples (spec.* / status.*) before
-    giving up. Tighten this once a real response has been observed."""
-    candidates = [
-        ("spec", "address"),
-        ("status", "address"),
-        ("spec", "ip"),
-        ("status", "ip"),
-        ("address",),
-        ("ip",),
-    ]
-    for path in candidates:
-        node: Any = payload
-        for key in path:
-            if not isinstance(node, dict) or key not in node:
-                node = None
-                break
-            node = node[key]
-        if isinstance(node, str) and node:
-            return node
+    status = payload.get("status")
+    if isinstance(status, dict):
+        ip = status.get("ipAddress")
+        if isinstance(ip, str) and ip:
+            return ip
     return None
 
 
 def _extract_status(payload: dict) -> str:
     status = payload.get("status")
     if isinstance(status, dict):
-        return str(status.get("phase") or status.get("state") or "unknown")
-    if isinstance(status, str):
-        return status
+        ready = status.get("ready")
+        if isinstance(ready, dict) and ready.get("state"):
+            return str(ready["state"])
     return "unknown"
+
+
+def _extract_name(payload: dict) -> str | None:
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    resource_id = metadata.get("id")
+    if not isinstance(resource_id, str):
+        return None
+    match = _RESOURCE_NAME_RE.search(resource_id)
+    return match.group("name") if match else None
 
 
 class MwsClient:
@@ -213,6 +235,12 @@ class MwsClient:
 
     def set_token(self, token: str) -> None:
         self._token = token
+
+    def _addresses_collection_path(self) -> str:
+        return f"/vpc/v1/projects/{self._settings.mws_project_id}/externalAddresses"
+
+    def _address_path(self, name: str) -> str:
+        return f"{self._addresses_collection_path()}/{name}"
 
     async def _ensure_token(self) -> None:
         """Make sure self._token holds a non-expired IAM access token. No-op in
@@ -256,12 +284,12 @@ class MwsClient:
         *,
         json_body: dict | None = None,
         params: dict | None = None,
-        idempotent_create: bool = False,
+        idempotency_key: bool = False,
     ) -> dict:
         await self._ensure_token()
-        url = f"{self._settings.mws_api_base}{path}"
+        url = f"{self._settings.mws_vpc_base}{path}"
         headers = {"Authorization": f"Bearer {self._token}"}
-        if idempotent_create:
+        if idempotency_key:
             headers["Idempotency-Key"] = str(uuid.uuid4())
         return await self._send(method, url, headers=headers, json_body=json_body, params=params)
 
@@ -288,6 +316,8 @@ class MwsClient:
                                        method, url, resp.status, attempt, MAX_RETRIES, delay)
                         await asyncio.sleep(delay)
                         continue
+                    if resp.status == 204:
+                        return {}
                     body = await self._read_json(resp)
                     if resp.status >= 400:
                         raise self._classify_error(resp.status, body)
@@ -319,76 +349,78 @@ class MwsClient:
     def _classify_error(status: int, body: dict) -> MwsApiError:
         code = body.get("code") if isinstance(body, dict) else None
         message = f"MWS API error {status}: {body}"
-        if status in (401, 403):
+        if status in (401, 403) or code in ("UNAUTHENTICATED", "PERMISSION_DENIED"):
             return MwsApiError("auth", message, status, code)
-        if status == 429:
+        if status == 429 or code == "TOO_MANY_REQUESTS":
             return MwsApiError("rate_limit", message, status, code)
-        if status in (402, 409) or (code and "quota" in str(code).lower()):
+        if code == "QUOTA_EXCEEDED":
             return MwsApiError("quota", message, status, code)
-        if status >= 500:
+        if status >= 500 or code in ("INTERNAL", "UNAVAILABLE"):
             return MwsApiError("server", message, status, code)
         return MwsApiError("unknown", message, status, code)
 
     async def create_ip(self) -> ReservedIp:
+        name = _generate_address_name()
+        spec: dict[str, Any] = {}
+        if self._settings.mws_nat_gateway:
+            spec["natGateway"] = self._settings.mws_nat_gateway
         body = {
-            "platform": {"productCode": PRODUCT_CODE, "regionCode": self._settings.mws_region_code},
-            "kind": RESOURCE_KIND,
-            "metadata": {"description": "mws-ip-hunter", "title": "ip-hunter-probe"},
-            "parentBinding": {"targetId": self._settings.mws_network_id},
-            "projectId": self._settings.mws_project_id,
-            "spec": {},
-            "zoneCode": self._settings.mws_zone_code,
+            "metadata": {"description": "mws-ip-hunter"},
+            "spec": spec,
         }
-        payload = await self._request("POST", CREATE_PATH, json_body=body, idempotent_create=True)
-        service_id = payload.get("id") or payload.get("serviceId")
-        if not service_id:
-            raise MwsApiError("unknown", f"create response had no service id: {payload}")
+        payload = await self._request(
+            "POST", self._address_path(name), json_body=body,
+            params={"createOnly": "true"}, idempotency_key=True,
+        )
         ip = _extract_ip(payload)
         if ip is None:
-            ip = await self._poll_for_ip(service_id)
-        return ReservedIp(service_id=service_id, ip=ip, status=_extract_status(payload),
+            ip = await self._poll_for_ip(name)
+        return ReservedIp(service_id=name, ip=ip, status=_extract_status(payload),
                            region=self._settings.mws_region)
 
-    async def _poll_for_ip(self, service_id: str, timeout_sec: float = 30.0, interval_sec: float = 2.0) -> str | None:
+    async def _poll_for_ip(self, name: str, timeout_sec: float = 30.0, interval_sec: float = 2.0) -> str | None:
         elapsed = 0.0
         while elapsed < timeout_sec:
-            payload = await self.get_service(service_id)
+            payload = await self.get_service(name)
             ip = _extract_ip(payload)
             if ip:
                 return ip
             await asyncio.sleep(interval_sec)
             elapsed += interval_sec
-        logger.error("timed out waiting for IP assignment on service %s; raw payload field mapping "
-                     "in _extract_ip likely needs updating once a real MWS response is inspected", service_id)
+        logger.error("timed out waiting for IP assignment on external address %s", name)
         return None
 
-    async def get_service(self, service_id: str) -> dict:
-        return await self._request("GET", f"{CREATE_PATH}/{service_id}")
+    async def get_service(self, name: str) -> dict:
+        return await self._request("GET", self._address_path(name))
 
     async def list_ip_services(self) -> list[ReservedIp]:
-        # TODO: confirm filter query params against OpenAPI; projectId + kind is a
-        # reasonable guess consistent with the create body shape.
-        payload = await self._request(
-            "GET", CREATE_PATH, params={"projectId": self._settings.mws_project_id, "kind": RESOURCE_KIND}
-        )
-        items = payload.get("items") if isinstance(payload, dict) else payload
-        if not isinstance(items, list):
-            return []
-        result = []
-        for item in items:
-            service_id = item.get("id") or item.get("serviceId")
-            if not service_id:
-                continue
-            result.append(ReservedIp(
-                service_id=service_id, ip=_extract_ip(item), status=_extract_status(item),
-                region=self._settings.mws_region,
-            ))
+        result: list[ReservedIp] = []
+        page_token: str | None = None
+        while True:
+            params: dict[str, Any] = {"pageSize": 200}
+            if page_token:
+                params["pageToken"] = page_token
+            payload = await self._request("GET", self._addresses_collection_path(), params=params)
+            items = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                break
+            for item in items:
+                name = _extract_name(item)
+                if not name:
+                    continue
+                result.append(ReservedIp(
+                    service_id=name, ip=_extract_ip(item), status=_extract_status(item),
+                    region=self._settings.mws_region,
+                ))
+            page_token = payload.get("nextPageToken")
+            if not page_token:
+                break
         return result
 
     async def delete_service(self, service_id: str) -> None:
         try:
-            await self._request("DELETE", f"{CREATE_PATH}/{service_id}")
+            await self._request("DELETE", self._address_path(service_id), idempotency_key=True)
         except MwsApiError as exc:
-            if exc.status in (404, 410):
+            if exc.status in (404, 410) or exc.code == "NOT_FOUND":
                 return  # already gone -- delete is idempotent
             raise
