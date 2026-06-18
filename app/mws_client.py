@@ -100,6 +100,17 @@ _AUTHORIZED_KEY_ID_RE = re.compile(
     r"/authorizedKeys/(?P<key>[^/]+)$"
 )
 _RESOURCE_NAME_RE = re.compile(r"/externalAddresses/(?P<name>[^/]+)$")
+_PROJECT_REF_RE = re.compile(r"(?:^|/)projects/(?P<id>[^/]+)$")
+
+
+def _normalize_project_id(value: str) -> str:
+    """Accept either a bare project id or a full resource-manager reference
+    (e.g. "rm/projects/<id>", as shown in some MWS console screens) and
+    return just the bare id -- the VPC API's {project} path segment always
+    expects the bare id, and naively interpolating a full reference there
+    doubles up the "projects/" segment (-> 404 "No static resource ...")."""
+    match = _PROJECT_REF_RE.search(value)
+    return match.group("id") if match else value
 
 
 class MwsApiError(Exception):
@@ -237,7 +248,8 @@ class MwsClient:
         self._token = token
 
     def _addresses_collection_path(self) -> str:
-        return f"/vpc/v1/projects/{self._settings.mws_project_id}/externalAddresses"
+        project = _normalize_project_id(self._settings.mws_project_id)
+        return f"/vpc/v1/projects/{project}/externalAddresses"
 
     def _address_path(self, name: str) -> str:
         return f"{self._addresses_collection_path()}/{name}"
