@@ -18,16 +18,28 @@ from app.proxy import ProxyConfig, build_connector
 logger = logging.getLogger(__name__)
 
 MENU_LAYOUT = [
-    ["▶️ /hunt", "⏹ /stop"],
-    ["📊 /status", "📋 /list"],
-    ["🎯 /found", "🧪 /calibrate"],
-    ["🔀 /strategy", "🌐 /target"],
-    ["🧦 /proxy", "⚙️ /limits"],
+    ["▶️ Старт", "⏹ Стоп"],
+    ["📊 Статус", "📋 Список"],
+    ["🎯 Найденные", "🧪 Калибровка"],
+    ["🔀 Стратегия", "🌐 Цель"],
+    ["🧦 Прокси", "⚙️ Лимиты"],
+    ["🧾 Логи"],
 ]
+
+_LIMIT_LABELS = {
+    "target_count": "🎯 Сколько найти",
+    "max_attempts": "🔁 Попыток (инфо)",
+    "max_runtime_min": "⏱ Время, мин (инфо)",
+    "max_budget": "💰 Бюджет (инфо)",
+}
 
 
 def build_main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(MENU_LAYOUT, resize_keyboard=True)
+
+
+def _cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
 
 
 def _ctx(context: ContextTypes.DEFAULT_TYPE) -> AppContext:
@@ -53,10 +65,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "MWS IP-Hunter\n"
         f"Статус перебора: {status}\n\n"
-        "/hunt — запустить\n/stop — остановить\n/status — статистика\n"
-        "/target — цель (CIDR/AS)\n/strategy — стратегия\n/calibrate — калибровка\n"
-        "/proxy — SOCKS5 прокси\n/list — текущие резервации\n/release — освободить\n"
-        "/found — найденные IP\n/limits — стоп-условия\n/logs — логи",
+        "Управляй кнопками внизу 👇 — набирать команды руками не нужно.\n"
+        "Для точечных операций (например, освободить конкретный IP по id) "
+        "команды вида /release <id> тоже работают.",
         reply_markup=build_main_menu(),
     )
 
@@ -102,28 +113,64 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(text)
 
 
+def _target_text(target: TargetConfig) -> str:
+    return (
+        "🌐 Цель:\n"
+        f"CIDR: {', '.join(target.cidrs) or '(пусто)'}\n"
+        f"ASN: {', '.join(map(str, sorted(target.asns))) or '(пусто)'}"
+    )
+
+
+def _target_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛰 CIDR", callback_data="target:cidr"),
+         InlineKeyboardButton("🔭 ASN", callback_data="target:asn")],
+        [InlineKeyboardButton("🧹 Очистить", callback_data="target:clear")],
+    ])
+
+
 @restricted
 async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ctx = _ctx(context)
     args = context.args
     target = ctx.hunter.limits.target
-    if not args:
-        await update.message.reply_text(
-            f"CIDR: {', '.join(target.cidrs) or '(пусто)'}\nASN: {', '.join(map(str, sorted(target.asns))) or '(пусто)'}"
-        )
+    if args:
+        sub = args[0].lower()
+        if sub == "clear":
+            ctx.hunter.limits.target = TargetConfig()
+        elif sub == "cidr" and len(args) > 1:
+            target.cidrs = [c.strip() for c in args[1].split(",") if c.strip()]
+        elif sub == "asn" and len(args) > 1:
+            target.asns = {int(a.strip().lstrip("ASas")) for a in args[1].split(",") if a.strip()}
+        else:
+            await update.message.reply_text("Использование: /target cidr <list> | /target asn <list> | /target clear")
+            return
+        await ctx.storage.set_config_json("target", ctx.hunter.limits.target.to_dict())
+        await update.message.reply_text("Цель обновлена.")
         return
-    sub = args[0].lower()
-    if sub == "clear":
+    await update.message.reply_text(_target_text(target), reply_markup=_target_keyboard())
+
+
+@restricted
+async def on_target_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx = _ctx(context)
+    query = update.callback_query
+    _, _, action = query.data.partition(":")
+    await query.answer()
+    if action == "clear":
         ctx.hunter.limits.target = TargetConfig()
-    elif sub == "cidr" and len(args) > 1:
-        target.cidrs = [c.strip() for c in args[1].split(",") if c.strip()]
-    elif sub == "asn" and len(args) > 1:
-        target.asns = {int(a.strip().lstrip("ASas")) for a in args[1].split(",") if a.strip()}
-    else:
-        await update.message.reply_text("Использование: /target cidr <list> | /target asn <list> | /target clear")
+        await ctx.storage.set_config_json("target", ctx.hunter.limits.target.to_dict())
+        await query.edit_message_text(_target_text(ctx.hunter.limits.target), reply_markup=_target_keyboard())
         return
-    await ctx.storage.set_config_json("target", ctx.hunter.limits.target.to_dict())
-    await update.message.reply_text("Цель обновлена.")
+    if action not in ("cidr", "asn"):
+        return
+    context.user_data["pending"] = {"kind": "target", "field": action}
+    prompt = (
+        "Отправьте CIDR через запятую, например: 1.2.3.0/24, 5.6.7.0/24"
+        if action == "cidr" else
+        "Отправьте ASN через запятую, например: 12345, 6789"
+    )
+    await query.edit_message_text(prompt, reply_markup=_cancel_keyboard())
 
 
 def _strategy_keyboard(current: str) -> InlineKeyboardMarkup:
@@ -184,31 +231,76 @@ async def cmd_calibrate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+def _proxy_keyboard(has_proxy: bool) -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton("✏️ Изменить", callback_data="proxy:edit"),
+        InlineKeyboardButton("🔎 Проверить", callback_data="proxy:test"),
+    ]]
+    if has_proxy:
+        rows.append([InlineKeyboardButton("🧹 Очистить", callback_data="proxy:clear")])
+    return InlineKeyboardMarkup(rows)
+
+
 @restricted
 async def cmd_proxy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ctx = _ctx(context)
     args = context.args
-    if not args:
-        masked = ProxyConfig.parse(ctx.proxy_raw).masked() if ctx.proxy_raw else "(не задан)"
-        await update.message.reply_text(f"Текущий прокси: {masked}")
+    if args:
+        if args[0] == "test":
+            await update.message.reply_text("Проверяю прокси...")
+            try:
+                ip = await _test_proxy(ctx.proxy_raw)
+                await update.message.reply_text(f"OK, внешний IP через прокси: {ip}")
+            except Exception as exc:
+                await update.message.reply_text(f"Ошибка проверки прокси: {exc}")
+            return
+        raw = args[0]
+        try:
+            ProxyConfig.parse(raw)
+        except ValueError as exc:
+            await update.message.reply_text(f"Не удалось разобрать прокси: {exc}")
+            return
+        await ctx.rebuild_mws_client(raw)
+        await ctx.storage.set_config("proxy", raw)
+        await update.message.reply_text(f"Прокси обновлён: {ProxyConfig.parse(raw).masked()}")
         return
-    if args[0] == "test":
-        await update.message.reply_text("Проверяю прокси...")
+    masked = ProxyConfig.parse(ctx.proxy_raw).masked() if ctx.proxy_raw else "(не задан)"
+    await update.message.reply_text(
+        f"🧦 Текущий прокси: {masked}", reply_markup=_proxy_keyboard(bool(ctx.proxy_raw))
+    )
+
+
+@restricted
+async def on_proxy_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx = _ctx(context)
+    query = update.callback_query
+    _, _, action = query.data.partition(":")
+    await query.answer()
+    if action == "edit":
+        context.user_data["pending"] = {"kind": "proxy"}
+        await query.edit_message_text(
+            "Отправьте прокси в формате host:port:user:pass (или host:port без авторизации):",
+            reply_markup=_cancel_keyboard(),
+        )
+        return
+    if action == "test":
+        masked = ProxyConfig.parse(ctx.proxy_raw).masked() if ctx.proxy_raw else "(не задан)"
         try:
             ip = await _test_proxy(ctx.proxy_raw)
-            await update.message.reply_text(f"OK, внешний IP через прокси: {ip}")
+            await query.edit_message_text(
+                f"🧦 Текущий прокси: {masked}\n✅ внешний IP: {ip}",
+                reply_markup=_proxy_keyboard(bool(ctx.proxy_raw)),
+            )
         except Exception as exc:
-            await update.message.reply_text(f"Ошибка проверки прокси: {exc}")
+            await query.edit_message_text(
+                f"🧦 Текущий прокси: {masked}\n⚠️ ошибка проверки: {exc}",
+                reply_markup=_proxy_keyboard(bool(ctx.proxy_raw)),
+            )
         return
-    raw = args[0]
-    try:
-        ProxyConfig.parse(raw)
-    except ValueError as exc:
-        await update.message.reply_text(f"Не удалось разобрать прокси: {exc}")
-        return
-    await ctx.rebuild_mws_client(raw)
-    await ctx.storage.set_config("proxy", raw)
-    await update.message.reply_text(f"Прокси обновлён: {ProxyConfig.parse(raw).masked()}")
+    if action == "clear":
+        await ctx.rebuild_mws_client("")
+        await ctx.storage.set_config("proxy", "")
+        await query.edit_message_text("🧦 Текущий прокси: (не задан)", reply_markup=_proxy_keyboard(False))
 
 
 async def _test_proxy(proxy_raw: str) -> str:
@@ -227,6 +319,18 @@ def _release_keyboard(rows) -> InlineKeyboardMarkup:
     ])
 
 
+def _list_keyboard(rows) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(f"🗑 {r.ip or r.service_id[:8]} [{r.status}]", callback_data=f"release:{r.service_id}")]
+        for r in rows
+    ]
+    buttons.append([
+        InlineKeyboardButton("🧹 Промахи", callback_data="releasemiss"),
+        InlineKeyboardButton("🗑 Все", callback_data="releaseall"),
+    ])
+    return InlineKeyboardMarkup(buttons)
+
+
 @restricted
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ctx = _ctx(context)
@@ -235,7 +339,19 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Нет активных резерваций.")
         return
     lines = [f"{r.service_id[:8]} {r.ip} [{r.status}]" for r in rows]
-    await update.message.reply_text("\n".join(lines), reply_markup=_release_keyboard(rows))
+    await update.message.reply_text("\n".join(lines), reply_markup=_list_keyboard(rows))
+
+
+@restricted
+async def on_bulk_release_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx = _ctx(context)
+    query = update.callback_query
+    await query.answer()
+    rows = await ctx.storage.list_reserved()
+    targets = rows if query.data == "releaseall" else [r for r in rows if r.status in ("pending", "held")]
+    for r in targets:
+        await ctx.hunter.release(r.service_id)
+    await query.edit_message_text(query.message.text + f"\n\n🗑 освобождено: {len(targets)}")
 
 
 @restricted
@@ -279,30 +395,58 @@ async def cmd_found(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _limits_text(limits) -> str:
+    return (
+        "⚙️ Лимиты (только для информации в /status, перебор не останавливают):\n"
+        f"{_LIMIT_LABELS['target_count']}: {limits.target_count}\n"
+        f"{_LIMIT_LABELS['max_attempts']}: {limits.max_attempts}\n"
+        f"{_LIMIT_LABELS['max_runtime_min']}: {limits.max_runtime_min}\n"
+        f"{_LIMIT_LABELS['max_budget']}: {limits.max_budget}"
+    )
+
+
+def _limits_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Цель", callback_data="limit:target_count"),
+         InlineKeyboardButton("✏️ Попытки", callback_data="limit:max_attempts")],
+        [InlineKeyboardButton("✏️ Время", callback_data="limit:max_runtime_min"),
+         InlineKeyboardButton("✏️ Бюджет", callback_data="limit:max_budget")],
+    ])
+
+
 @restricted
 async def cmd_limits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ctx = _ctx(context)
     limits = ctx.hunter.limits
     args = context.args
-    if not args or len(args) < 2:
-        await update.message.reply_text(
-            f"target_count: {limits.target_count}\nmax_attempts: {limits.max_attempts}\n"
-            f"max_runtime_min: {limits.max_runtime_min}\nmax_budget: {limits.max_budget}\n\n"
-            "Изменить: /limits <поле> <значение>"
-        )
+    if args and len(args) >= 2:
+        field, value = args[0], args[1]
+        int_fields = {"target_count", "max_attempts", "max_runtime_min"}
+        float_fields = {"max_budget"}
+        if field in int_fields:
+            setattr(limits, field, int(value))
+        elif field in float_fields:
+            setattr(limits, field, float(value))
+        else:
+            await update.message.reply_text("Неизвестное поле.")
+            return
+        await ctx.storage.set_config(field, value)
+        await update.message.reply_text(f"{field} = {value}")
         return
-    field, value = args[0], args[1]
-    int_fields = {"target_count", "max_attempts", "max_runtime_min"}
-    float_fields = {"max_budget"}
-    if field in int_fields:
-        setattr(limits, field, int(value))
-    elif field in float_fields:
-        setattr(limits, field, float(value))
-    else:
-        await update.message.reply_text("Неизвестное поле.")
+    await update.message.reply_text(_limits_text(limits), reply_markup=_limits_keyboard())
+
+
+@restricted
+async def on_limit_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    _, _, field = query.data.partition(":")
+    await query.answer()
+    if field not in _LIMIT_LABELS:
         return
-    await ctx.storage.set_config(field, value)
-    await update.message.reply_text(f"{field} = {value}")
+    context.user_data["pending"] = {"kind": "limit", "field": field}
+    await query.edit_message_text(
+        f"Отправьте новое значение для «{_LIMIT_LABELS[field]}»:", reply_markup=_cancel_keyboard()
+    )
 
 
 @restricted
@@ -338,22 +482,76 @@ async def on_action_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 _MENU_DISPATCH = {
-    "▶️ /hunt": cmd_hunt,
-    "⏹ /stop": cmd_stop,
-    "📊 /status": cmd_status,
-    "📋 /list": cmd_list,
-    "🎯 /found": cmd_found,
-    "🧪 /calibrate": cmd_calibrate,
-    "🔀 /strategy": cmd_strategy,
-    "🌐 /target": cmd_target,
-    "🧦 /proxy": cmd_proxy,
-    "⚙️ /limits": cmd_limits,
+    "▶️ Старт": cmd_hunt,
+    "⏹ Стоп": cmd_stop,
+    "📊 Статус": cmd_status,
+    "📋 Список": cmd_list,
+    "🎯 Найденные": cmd_found,
+    "🧪 Калибровка": cmd_calibrate,
+    "🔀 Стратегия": cmd_strategy,
+    "🌐 Цель": cmd_target,
+    "🧦 Прокси": cmd_proxy,
+    "⚙️ Лимиты": cmd_limits,
+    "🧾 Логи": cmd_logs,
 }
 
 
 @restricted
-async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("pending", None)
+    await query.edit_message_text(query.message.text + "\n\n❌ отменено")
+
+
+async def _apply_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, pending: dict, text: str) -> None:
+    ctx = _ctx(context)
+    kind = pending.get("kind")
+    if kind == "target":
+        field = pending["field"]
+        target = ctx.hunter.limits.target
+        if field == "cidr":
+            target.cidrs = [c.strip() for c in text.split(",") if c.strip()]
+        else:
+            try:
+                target.asns = {int(a.strip().lstrip("ASas")) for a in text.split(",") if a.strip()}
+            except ValueError:
+                await update.message.reply_text("Не получилось разобрать ASN. Пример: 12345, 6789")
+                return
+        await ctx.storage.set_config_json("target", target.to_dict())
+        await update.message.reply_text("✅ Цель обновлена.\n" + _target_text(target))
+    elif kind == "proxy":
+        raw = text.strip()
+        try:
+            ProxyConfig.parse(raw)
+        except ValueError as exc:
+            await update.message.reply_text(f"Не удалось разобрать прокси: {exc}")
+            return
+        await ctx.rebuild_mws_client(raw)
+        await ctx.storage.set_config("proxy", raw)
+        await update.message.reply_text(f"✅ Прокси обновлён: {ProxyConfig.parse(raw).masked()}")
+    elif kind == "limit":
+        field = pending["field"]
+        limits = ctx.hunter.limits
+        int_fields = {"target_count", "max_attempts", "max_runtime_min"}
+        try:
+            value = int(text) if field in int_fields else float(text)
+        except ValueError:
+            await update.message.reply_text("Нужно число. Попробуйте снова через ⚙️ Лимиты.")
+            return
+        setattr(limits, field, value)
+        await ctx.storage.set_config(field, str(value))
+        await update.message.reply_text(f"✅ {_LIMIT_LABELS[field]} = {value}")
+
+
+@restricted
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text.strip() if update.message and update.message.text else ""
+    pending = context.user_data.get("pending")
+    if pending is not None:
+        context.user_data.pop("pending", None)
+        await _apply_pending(update, context, pending, text)
+        return
     handler = _MENU_DISPATCH.get(text)
     if handler is None:
         return
@@ -377,4 +575,9 @@ def register_handlers(application) -> None:
     application.add_handler(CommandHandler("logs", cmd_logs))
     application.add_handler(CallbackQueryHandler(on_strategy_button, pattern=r"^strategy:"))
     application.add_handler(CallbackQueryHandler(on_action_button, pattern=r"^(keep|continue|release):"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_menu_button))
+    application.add_handler(CallbackQueryHandler(on_target_button, pattern=r"^target:"))
+    application.add_handler(CallbackQueryHandler(on_proxy_button, pattern=r"^proxy:"))
+    application.add_handler(CallbackQueryHandler(on_limit_button, pattern=r"^limit:"))
+    application.add_handler(CallbackQueryHandler(on_bulk_release_button, pattern=r"^(releaseall|releasemiss)$"))
+    application.add_handler(CallbackQueryHandler(on_cancel_button, pattern=r"^cancel$"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
