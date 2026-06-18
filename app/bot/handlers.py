@@ -6,8 +6,8 @@ import functools
 import logging
 
 import aiohttp
-from telegram import Update
-from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from app.calibrate import run as run_calibration
 from app.context import AppContext
@@ -16,6 +16,18 @@ from app.matcher import TargetConfig
 from app.proxy import ProxyConfig, build_connector
 
 logger = logging.getLogger(__name__)
+
+MENU_LAYOUT = [
+    ["▶️ /hunt", "⏹ /stop"],
+    ["📊 /status", "📋 /list"],
+    ["🎯 /found", "🧪 /calibrate"],
+    ["🔀 /strategy", "🌐 /target"],
+    ["🧦 /proxy", "⚙️ /limits"],
+]
+
+
+def build_main_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(MENU_LAYOUT, resize_keyboard=True)
 
 
 def _ctx(context: ContextTypes.DEFAULT_TYPE) -> AppContext:
@@ -44,7 +56,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/hunt — запустить\n/stop — остановить\n/status — статистика\n"
         "/target — цель (CIDR/AS)\n/strategy — стратегия\n/calibrate — калибровка\n"
         "/proxy — SOCKS5 прокси\n/list — текущие резервации\n/release — освободить\n"
-        "/found — найденные IP\n/limits — стоп-условия\n/logs — логи"
+        "/found — найденные IP\n/limits — стоп-условия\n/logs — логи",
+        reply_markup=build_main_menu(),
     )
 
 
@@ -113,12 +126,25 @@ async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("Цель обновлена.")
 
 
+def _strategy_keyboard(current: str) -> InlineKeyboardMarkup:
+    def label(value: str) -> str:
+        return f"✅ {value}" if value == current else value
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label(STRATEGY_RELEASE_IMMEDIATELY), callback_data=f"strategy:{STRATEGY_RELEASE_IMMEDIATELY}")],
+        [InlineKeyboardButton(label(STRATEGY_HOLD_WINDOW), callback_data=f"strategy:{STRATEGY_HOLD_WINDOW}")],
+    ])
+
+
 @restricted
 async def cmd_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ctx = _ctx(context)
     args = context.args
     if not args:
-        await update.message.reply_text(f"Текущая стратегия: {ctx.hunter.limits.strategy}")
+        current = ctx.hunter.limits.strategy
+        await update.message.reply_text(
+            f"Текущая стратегия: {current}", reply_markup=_strategy_keyboard(current)
+        )
         return
     value = args[0].strip()
     if value not in (STRATEGY_RELEASE_IMMEDIATELY, STRATEGY_HOLD_WINDOW):
@@ -127,6 +153,19 @@ async def cmd_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ctx.hunter.limits.strategy = value
     await ctx.storage.set_config("strategy", value)
     await update.message.reply_text(f"Стратегия установлена: {value}")
+
+
+@restricted
+async def on_strategy_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ctx = _ctx(context)
+    query = update.callback_query
+    _, _, value = query.data.partition(":")
+    await query.answer()
+    if value not in (STRATEGY_RELEASE_IMMEDIATELY, STRATEGY_HOLD_WINDOW):
+        return
+    ctx.hunter.limits.strategy = value
+    await ctx.storage.set_config("strategy", value)
+    await query.edit_message_text(f"Текущая стратегия: {value}", reply_markup=_strategy_keyboard(value))
 
 
 @restricted
@@ -181,6 +220,13 @@ async def _test_proxy(proxy_raw: str) -> str:
             return data["ip"]
 
 
+def _release_keyboard(rows) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🗑 {r.ip or r.service_id[:8]}", callback_data=f"release:{r.service_id}")]
+        for r in rows
+    ])
+
+
 @restricted
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ctx = _ctx(context)
@@ -189,7 +235,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Нет активных резерваций.")
         return
     lines = [f"{r.service_id[:8]} {r.ip} [{r.status}]" for r in rows]
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), reply_markup=_release_keyboard(rows))
 
 
 @restricted
@@ -227,7 +273,10 @@ async def cmd_found(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not rows:
         await update.message.reply_text("Пока ничего не найдено.")
         return
-    await update.message.reply_text("\n".join(f"{r.ip} ({r.service_id[:8]})" for r in rows))
+    await update.message.reply_text(
+        "\n".join(f"{r.ip} ({r.service_id[:8]})" for r in rows),
+        reply_markup=_release_keyboard(rows),
+    )
 
 
 @restricted
@@ -235,7 +284,7 @@ async def cmd_limits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     ctx = _ctx(context)
     limits = ctx.hunter.limits
     args = context.args
-    if len(args) < 2:
+    if not args or len(args) < 2:
         await update.message.reply_text(
             f"target_count: {limits.target_count}\nmax_attempts: {limits.max_attempts}\n"
             f"max_runtime_min: {limits.max_runtime_min}\nmax_budget: {limits.max_budget}\n\n"
@@ -270,7 +319,7 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @restricted
-async def on_hit_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_action_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ctx = _ctx(context)
     query = update.callback_query
     action, _, service_id = query.data.partition(":")
@@ -281,9 +330,35 @@ async def on_hit_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         ctx.hunter.limits.target_count += 1
         await query.edit_message_text(query.message.text + "\n\n🔁 ищем ещё один")
     elif action == "release":
+        record = await ctx.storage.get_reserved(service_id)
         await ctx.hunter.release(service_id)
-        ctx.hunter.stats.found = max(0, ctx.hunter.stats.found - 1)
+        if record is not None and record.status == "kept":
+            ctx.hunter.stats.found = max(0, ctx.hunter.stats.found - 1)
         await query.edit_message_text(query.message.text + "\n\n🗑 освобождён")
+
+
+_MENU_DISPATCH = {
+    "▶️ /hunt": cmd_hunt,
+    "⏹ /stop": cmd_stop,
+    "📊 /status": cmd_status,
+    "📋 /list": cmd_list,
+    "🎯 /found": cmd_found,
+    "🧪 /calibrate": cmd_calibrate,
+    "🔀 /strategy": cmd_strategy,
+    "🌐 /target": cmd_target,
+    "🧦 /proxy": cmd_proxy,
+    "⚙️ /limits": cmd_limits,
+}
+
+
+@restricted
+async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text.strip() if update.message and update.message.text else ""
+    handler = _MENU_DISPATCH.get(text)
+    if handler is None:
+        return
+    context.args = []
+    await handler(update, context)
 
 
 def register_handlers(application) -> None:
@@ -300,4 +375,6 @@ def register_handlers(application) -> None:
     application.add_handler(CommandHandler("found", cmd_found))
     application.add_handler(CommandHandler("limits", cmd_limits))
     application.add_handler(CommandHandler("logs", cmd_logs))
-    application.add_handler(CallbackQueryHandler(on_hit_button))
+    application.add_handler(CallbackQueryHandler(on_strategy_button, pattern=r"^strategy:"))
+    application.add_handler(CallbackQueryHandler(on_action_button, pattern=r"^(keep|continue|release):"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_menu_button))

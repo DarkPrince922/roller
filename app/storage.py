@@ -193,6 +193,13 @@ class Storage:
         await self.conn.execute("DELETE FROM reserved WHERE service_id = ?", (service_id,))
         await self.conn.commit()
 
+    async def get_reserved(self, service_id: str) -> ReservedRecord | None:
+        cur = await self.conn.execute("SELECT * FROM reserved WHERE service_id = ?", (service_id,))
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return ReservedRecord(row["service_id"], row["ip"], row["status"], row["reserved_at"], row["region"])
+
     async def list_reserved(self, status: str | None = None) -> list[ReservedRecord]:
         if status is None:
             cur = await self.conn.execute("SELECT * FROM reserved ORDER BY reserved_at ASC")
