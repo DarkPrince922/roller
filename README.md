@@ -31,6 +31,11 @@ docker compose up --build
 `/found`, `/limits [<поле> <значение>]`, `/logs [n]`. Доступ только для
 chat_id из `TELEGRAM_ALLOWED_CHAT_IDS`.
 
+`/start` показывает постоянную клавиатуру с кнопками для команд без
+аргументов (hunt/stop/status/list/found/calibrate/strategy/target/proxy/
+limits). `/strategy` без аргумента и каждый IP в `/list`/`/found` также
+показывают inline-кнопки (переключение стратегии, точечное `release`).
+
 ## Структура
 
 ```
