@@ -6,6 +6,7 @@ venv/
 data/*.sqlite
 data/*.sqlite-journal
 data/*.tsv
+data/*.json
 !data/.gitkeep
 .idea/
 .vscode/
