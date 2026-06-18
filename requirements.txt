@@ -4,3 +4,4 @@ python-telegram-bot>=21.0,<22
 aiosqlite>=0.20,<1
 structlog>=24.1,<25
 python-dotenv>=1.0,<2
+PyJWT[crypto]>=2.8,<3

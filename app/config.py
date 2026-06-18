@@ -33,7 +33,9 @@ class Settings:
     telegram_allowed_chat_ids: set[int]
 
     mws_api_base: str
+    mws_iam_base: str
     mws_api_token: str
+    mws_sa_key_file: Path | None
     mws_project_id: str
     mws_network_id: str
     mws_region: str
@@ -63,7 +65,11 @@ class Settings:
             telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
             telegram_allowed_chat_ids=_csv_ints(os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "")),
             mws_api_base=os.environ.get("MWS_API_BASE", "https://gateway.cloud.mts.ru").rstrip("/"),
+            mws_iam_base=os.environ.get("MWS_IAM_BASE", "https://iam.mwsapis.ru").rstrip("/"),
             mws_api_token=os.environ.get("MWS_API_TOKEN", ""),
+            mws_sa_key_file=(
+                Path(raw) if (raw := os.environ.get("MWS_SA_KEY_FILE", "").strip()) else None
+            ),
             mws_project_id=os.environ.get("MWS_PROJECT_ID", ""),
             mws_network_id=os.environ.get("MWS_NETWORK_ID", ""),
             mws_region=os.environ.get("MWS_REGION", "msk"),
