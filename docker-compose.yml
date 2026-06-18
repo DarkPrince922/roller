@@ -1,0 +1,9 @@
+services:
+  mws-ip-hunter:
+    build: .
+    container_name: mws-ip-hunter
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
