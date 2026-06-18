@@ -1,0 +1,6 @@
+aiohttp>=3.9,<4
+aiohttp-socks>=0.8,<1
+python-telegram-bot>=21.0,<22
+aiosqlite>=0.20,<1
+structlog>=24.1,<25
+python-dotenv>=1.0,<2
