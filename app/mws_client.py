@@ -361,13 +361,22 @@ class MwsClient:
     def _classify_error(status: int, body: dict) -> MwsApiError:
         code = body.get("code") if isinstance(body, dict) else None
         message = f"MWS API error {status}: {body}"
-        if status in (401, 403) or code in ("UNAUTHENTICATED", "PERMISSION_DENIED"):
-            return MwsApiError("auth", message, status, code)
-        if status == 429 or code == "TOO_MANY_REQUESTS":
-            return MwsApiError("rate_limit", message, status, code)
+        # The explicit `code` is authoritative when present -- e.g. QUOTA_EXCEEDED can
+        # come back with HTTP 403, which would otherwise be misclassified as "auth"
+        # if status were checked first.
         if code == "QUOTA_EXCEEDED":
             return MwsApiError("quota", message, status, code)
-        if status >= 500 or code in ("INTERNAL", "UNAVAILABLE"):
+        if code == "TOO_MANY_REQUESTS":
+            return MwsApiError("rate_limit", message, status, code)
+        if code in ("UNAUTHENTICATED", "PERMISSION_DENIED"):
+            return MwsApiError("auth", message, status, code)
+        if code in ("INTERNAL", "UNAVAILABLE"):
+            return MwsApiError("server", message, status, code)
+        if status in (401, 403):
+            return MwsApiError("auth", message, status, code)
+        if status == 429:
+            return MwsApiError("rate_limit", message, status, code)
+        if status >= 500:
             return MwsApiError("server", message, status, code)
         return MwsApiError("unknown", message, status, code)
 
