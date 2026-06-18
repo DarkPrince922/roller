@@ -135,16 +135,12 @@ class Hunter:
             await self.notifier("stop", {"reason": reason.value, "stats": self.stats})
 
     def _check_stop_conditions(self) -> StopReason | None:
+        """Only a manual /stop (or a fatal error surfaced elsewhere in the loop) ends
+        the hunt. target_count/max_attempts/max_runtime_min/max_budget are intentionally
+        not enforced here -- they stay around as informational config consumed by
+        /status and /limits, but the hunt itself runs indefinitely."""
         if self._stop_event.is_set():
             return StopReason.MANUAL
-        if self.stats.found >= self.limits.target_count:
-            return StopReason.TARGET_REACHED
-        if self.stats.attempts >= self.limits.max_attempts:
-            return StopReason.MAX_ATTEMPTS
-        if self.stats.elapsed_min() >= self.limits.max_runtime_min:
-            return StopReason.MAX_RUNTIME
-        if self.limits.max_budget > 0 and self.estimated_cost() >= self.limits.max_budget:
-            return StopReason.MAX_BUDGET
         return None
 
     def estimated_cost(self) -> float:
