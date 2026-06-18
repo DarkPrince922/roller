@@ -156,18 +156,21 @@ class Hunter:
         try:
             reserved = await self.mws.create_ip()
         except MwsApiError as exc:
-            await self.notifier("error", {"message": str(exc), "kind": exc.kind})
             if exc.kind == "quota":
                 # The real account-side quota may be lower than self.limits.quota
                 # (the pre-check in _run() only guards against the configured value),
                 # so a quota error here doesn't necessarily mean we're stuck -- free up
-                # the oldest non-target reservation and let the loop retry.
+                # the oldest non-target reservation and let the loop retry. Silent: this
+                # is routine self-correction, not worth alerting on every occurrence.
                 candidate = await self._pick_release_candidate()
                 if candidate is not None:
                     await self.release(candidate)
                     return
+                await self.notifier("error", {"message": str(exc), "kind": exc.kind})
                 self._stop_event.set()
-            elif exc.kind == "auth":
+                return
+            await self.notifier("error", {"message": str(exc), "kind": exc.kind})
+            if exc.kind == "auth":
                 self._stop_event.set()
             return
 
